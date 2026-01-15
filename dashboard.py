@@ -1,286 +1,266 @@
-import os
-import pandas as pd
 import streamlit as st
-from datetime import date
+import pandas as pd
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from io import BytesIO
 import plotly.express as px
+import hashlib
+import datetime
+import unicodedata
+import re
+import os
 
 # =============================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # =============================
-st.set_page_config(page_title="Conciliación de Pagos", layout="wide")
+st.set_page_config(page_title="Reporte de Pagos", layout="wide")
 
-RUTA_EXCEL = r"C:\Users\CONFIGURACION\Desktop\Conciliacion_Pagos\Excel"
-RUTA_USUARIOS = r"C:\Users\CONFIGURACION\Desktop\Conciliacion_Pagos\usuarios.xlsx"
-
-PERMISOS = ["Editar Datos", "Crear Usuarios", "Modificar Usuarios", "Asignar Permisos", "Acceso Reportes"]
+FOLDER_ID = "1VWq_kfZebHVMmJ64_Zlj4wNy70_NN-_b"
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # =============================
-# FUNCIONES USUARIOS
+# UTILIDADES DE SEGURIDAD
 # =============================
-USUARIOS = {}
+def hash_pass(p):
+    return hashlib.sha256(p.encode()).hexdigest()
 
-def guardar_usuarios_excel():
-    df = pd.DataFrame([
-        {"usuario": u, "password": v["password"], "permisos": ",".join(v["permisos"])}
-        for u,v in USUARIOS.items()
-    ])
-    df.to_excel(RUTA_USUARIOS, index=False)
-
-def cargar_usuarios_excel():
-    global USUARIOS
-    if os.path.exists(RUTA_USUARIOS):
-        df = pd.read_excel(RUTA_USUARIOS)
-        USUARIOS = {}
-        for _, row in df.iterrows():
-            USUARIOS[row["usuario"]] = {
-                "password": row["password"],
-                "permisos": row["permisos"].split(",") if pd.notna(row["permisos"]) else []
-            }
-    else:
-        # Usuario administrador inicial
-        USUARIOS["WANDER"] = {"password":"DIPRE.W01", "permisos": PERMISOS}
-        guardar_usuarios_excel()
-
-cargar_usuarios_excel()
+def log_event(msg):
+    st.session_state.logs.append(
+        f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {msg}"
+    )
 
 # =============================
-# LOGIN SIMPLE
+# ESTADO INICIAL
 # =============================
-if "usuario" not in st.session_state:
-    st.session_state.usuario = None
+if "users" not in st.session_state:
+    st.session_state.users = {
+        "WANDER DIPRE": {
+            "password": hash_pass("DIPRE.W01"),
+            "admin": True
+        }
+    }
 
-def login():
-    st.title("🔐 Acceso al Dashboard")
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+
+# =============================
+# LOGIN
+# =============================
+if not st.session_state.auth:
+    st.title("🔐 Acceso al sistema")
+
     u = st.text_input("Usuario")
     p = st.text_input("Contraseña", type="password")
 
     if st.button("Ingresar"):
-        if u in USUARIOS and USUARIOS[u]["password"] == p:
-            st.session_state.usuario = u
+        user = st.session_state.users.get(u)
+        if user and user["password"] == hash_pass(p):
+            st.session_state.auth = True
+            st.session_state.user = u
+            log_event(f"Login exitoso: {u}")
             st.rerun()
         else:
             st.error("Credenciales incorrectas")
 
-if st.session_state.usuario is None:
-    login()
     st.stop()
 
 # =============================
-# CARGA DE EXCEL CON FECHAS
-# =============================
-@st.cache_data(ttl=5)
-def cargar_datos():
-    lista = []
-
-    if not os.path.exists(RUTA_EXCEL):
-        st.error(f"No existe la ruta: {RUTA_EXCEL}")
-        st.stop()
-
-    archivos = os.listdir(RUTA_EXCEL)
-
-    meses = {
-        "enero": "01","febrero": "02","marzo": "03","abril": "04",
-        "mayo": "05","junio": "06","julio": "07","agosto": "08",
-        "septiembre": "09","octubre": "10","noviembre": "11","diciembre": "12"
-    }
-
-    for archivo in archivos:
-        if archivo.lower().endswith((".xlsx", ".xls")) and not archivo.startswith("~$"):
-            try:
-                ruta = os.path.join(RUTA_EXCEL, archivo)
-                df = pd.read_excel(ruta)
-                df.columns = df.columns.str.strip().str.lower()
-
-                # Fecha
-                if "fecha" in df.columns:
-                    temp = df["fecha"].astype(str).str.upper().str.replace(" DE ", " ", regex=False)
-                    temp = temp.str.lower()
-                    for nombre, numero in meses.items():
-                        temp = temp.str.replace(nombre, numero, regex=False)
-                    df["fecha"] = pd.to_datetime(temp, dayfirst=True, errors="coerce")
-
-                # Monto
-                if "monto" in df.columns:
-                    df["monto"] = df["monto"].astype(str).str.replace("$","",regex=False).str.replace(",","",regex=False)
-                    df["monto"] = pd.to_numeric(df["monto"], errors="coerce").fillna(0)
-
-                # Unificar bancos
-                if "banco" in df.columns:
-                    df["banco"] = df["banco"].str.upper()
-                    df["banco"] = df["banco"].replace({
-                        "RESERVA": "BANRESERVAS",
-                        "RESERVAS": "BANRESERVAS",
-                        "BAN RESERVAS": "BANRESERVAS",
-                        "BANRESERVAS": "BANRESERVAS",
-                        "POPULAR": "POPULAR"
-                    })
-
-                lista.append(df)
-
-            except Exception as e:
-                st.warning(f"Error leyendo {archivo}: {e}")
-
-    if not lista:
-        st.error("❌ No se encontraron archivos Excel válidos en la carpeta")
-        st.stop()
-
-    return pd.concat(lista, ignore_index=True)
-
-df = cargar_datos()
-
-# =============================
-# PANEL ADMINISTRADOR (solo WANDER)
-# =============================
-def panel_admin():
-    st.header("⚙️ Panel de Administración - WANDER")
-    accion = st.selectbox("Selecciona acción", ["Usuarios", "Editar Datos"])
-
-    if accion == "Usuarios":
-        st.subheader("Gestionar Usuarios")
-        usuario_sel = st.selectbox("Selecciona usuario", list(USUARIOS.keys()))
-
-        # Cambiar contraseña
-        nueva_pass = st.text_input("Nueva contraseña", type="password", key="pass_mod")
-        if st.button("Actualizar contraseña", key="btn_pass"):
-            if nueva_pass:
-                USUARIOS[usuario_sel]["password"] = nueva_pass
-                guardar_usuarios_excel()
-                st.success(f"Contraseña de {usuario_sel} actualizada.")
-
-        # Cambiar permisos
-        permisos_actuales = USUARIOS[usuario_sel]["permisos"]
-        permisos_sel = st.multiselect("Permisos", PERMISOS, default=permisos_actuales, key="perm_mod")
-        if st.button("Actualizar permisos", key="btn_perm"):
-            USUARIOS[usuario_sel]["permisos"] = permisos_sel
-            guardar_usuarios_excel()
-            st.success(f"Permisos de {usuario_sel} actualizados.")
-
-        # Crear nuevo usuario
-        st.subheader("Crear Nuevo Usuario")
-        nuevo_usuario = st.text_input("Nombre de usuario", key="new_user")
-        nueva_pass_nuevo = st.text_input("Contraseña", type="password", key="new_pass")
-        permisos_nuevo = st.multiselect("Permisos", PERMISOS, default=["Acceso Reportes"], key="perm_new")
-        if st.button("Crear Usuario", key="btn_new"):
-            if nuevo_usuario and nueva_pass_nuevo:
-                if nuevo_usuario in USUARIOS:
-                    st.warning("El usuario ya existe")
-                else:
-                    USUARIOS[nuevo_usuario] = {"password": nueva_pass_nuevo, "permisos": permisos_nuevo}
-                    guardar_usuarios_excel()
-                    st.success(f"Usuario {nuevo_usuario} creado.")
-
-    elif accion == "Editar Datos":
-        st.subheader("Editar Pagos")
-        st.info("Selecciona celdas y modifica valores. Los cambios se guardarán en Excel.")
-
-        df_edit = st.data_editor(df, use_container_width=True)
-        if st.button("Guardar cambios en Excel", key="guardar_excel"):
-            ruta_guardado = os.path.join(RUTA_EXCEL, "Conciliacion_Pagos_Actualizado.xlsx")
-            df_edit.to_excel(ruta_guardado, index=False)
-            st.success(f"Cambios guardados en {ruta_guardado}")
-
-# =============================
-# SIDEBAR Y FILTROS
+# SIDEBAR
 # =============================
 with st.sidebar:
-    st.markdown(f"👤 **Usuario:** {st.session_state.usuario}")
-    if st.button("👁️ Actualizar"):
-        st.cache_data.clear()
+    st.title("⚙️ Menú")
+
+    if st.button("🔒 Cerrar sesión"):
+        log_event(f"Cierre de sesión: {st.session_state.user}")
+        st.session_state.auth = False
         st.rerun()
-    st.markdown("## 🔎 Filtros")
+
+    # =============================
+    # ADMINISTRACIÓN DE USUARIOS
+    # =============================
+    if st.session_state.users[st.session_state.user]["admin"]:
+        st.markdown("---")
+        st.subheader("👥 Administración de Usuarios")
+
+        # CREAR USUARIO
+        with st.expander("➕ Crear usuario"):
+            new_user = st.text_input("Usuario nuevo")
+            new_pass = st.text_input("Contraseña", type="password")
+            is_admin = st.checkbox("Administrador")
+
+            if st.button("Crear usuario"):
+                if not new_user or not new_pass:
+                    st.error("Usuario y contraseña obligatorios")
+                elif new_user in st.session_state.users:
+                    st.error("El usuario ya existe")
+                else:
+                    st.session_state.users[new_user] = {
+                        "password": hash_pass(new_pass),
+                        "admin": is_admin
+                    }
+                    log_event(f"Usuario creado: {new_user}")
+                    st.success("Usuario creado correctamente")
+
+        # CAMBIAR CONTRASEÑA
+        with st.expander("🔑 Cambiar contraseña"):
+            sel_user = st.selectbox(
+                "Usuario",
+                list(st.session_state.users.keys())
+            )
+            new_pwd = st.text_input("Nueva contraseña", type="password")
+
+            if st.button("Actualizar contraseña"):
+                if new_pwd:
+                    st.session_state.users[sel_user]["password"] = hash_pass(new_pwd)
+                    log_event(f"Contraseña actualizada: {sel_user}")
+                    st.success("Contraseña actualizada")
+                else:
+                    st.error("Contraseña vacía")
+
+        # ELIMINAR USUARIO
+        with st.expander("🗑 Eliminar usuario"):
+            del_user = st.selectbox(
+                "Usuario a eliminar",
+                [u for u in st.session_state.users if u != st.session_state.user]
+            )
+
+            if st.button("Eliminar usuario"):
+                del st.session_state.users[del_user]
+                log_event(f"Usuario eliminado: {del_user}")
+                st.success("Usuario eliminado")
+
+# =============================
+# GOOGLE DRIVE
+# =============================
+creds = service_account.Credentials.from_service_account_info(
+    st.secrets["gdrive"],
+    scopes=SCOPES
+)
+service = build("drive", "v3", credentials=creds)
+
+def listar_archivos(folder_id):
+    q = f"'{folder_id}' in parents and trashed=false"
+    return service.files().list(
+        q=q, fields="files(id,name,mimeType)"
+    ).execute().get("files", [])
+
+def leer_excel(file_id):
+    data = service.files().get_media(fileId=file_id).execute()
+    return pd.read_excel(BytesIO(data))
+
+# =============================
+# UTILIDADES DE DATOS
+# =============================
+def limpiar_texto(t):
+    if pd.isna(t):
+        return ""
+    t = unicodedata.normalize("NFKD", str(t).lower()).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9 ]", "", t)
+
+def banco_norm(b):
+    b = limpiar_texto(b)
+    if "popular" in b:
+        return "POPULAR"
+    if "reserva" in b:
+        return "BANRESERVAS"
+    return ""
+
+def money(x):
+    return f"$ {x:,.2f}"
+
+# =============================
+# CARGA DE EXCEL
+# =============================
+dfs = []
+for f in listar_archivos(FOLDER_ID):
+    if f["name"].lower().endswith(".xlsx"):
+        df = leer_excel(f["id"])
+        df["archivo"] = f["name"]
+        dfs.append(df)
+
+if not dfs:
+    st.error("No se encontraron archivos Excel en Google Drive")
+    st.stop()
+
+df = pd.concat(dfs, ignore_index=True)
+df.columns = df.columns.str.lower().str.strip()
+
+df["fecha"] = pd.to_datetime(df.get("fecha"), errors="coerce")
+df["monto"] = pd.to_numeric(df.get("monto"), errors="coerce")
+df["banco"] = df.get("banco").apply(banco_norm)
+
+# =============================
+# HEADER
+# =============================
+if os.path.exists("logo.png"):
+    st.image("logo.png", width=180)
+
+st.title("REPORTE DE PAGOS DE FINANCIAMOTO LA FUENTE, S.R.L")
+
+# =============================
+# KPIs
+# =============================
+k1, k2 = st.columns(2)
+k1.metric("💰 Total Pagado", money(df["monto"].sum()))
+k2.metric("📄 Total de Pagos", len(df))
+
+# =============================
+# FILTROS
+# =============================
+st.subheader("🔍 Filtros")
+
+c1, c2, c3, c4 = st.columns(4)
+f_codigo = c1.text_input("Buscar por Código")
+f_prestamo = c2.text_input("Buscar por Préstamo")
+f_nombre = c3.text_input("Buscar por Nombre")
+f_banco = c4.selectbox("Banco", ["", "POPULAR", "BANRESERVAS"])
 
 df_f = df.copy()
 
-# -----------------------------
-# FILTROS INDEPENDIENTES
-# -----------------------------
-mask_fecha = pd.Series(True, index=df_f.index)
-usar_fecha = st.sidebar.checkbox("Filtrar por fecha")
-if usar_fecha and "fecha" in df_f.columns:
-    rango = st.sidebar.date_input("Rango de fechas", value=(date(2026,1,1), date.today()))
-    if len(rango) == 2:
-        mask_fecha = (df_f["fecha"] >= pd.to_datetime(rango[0])) & (df_f["fecha"] <= pd.to_datetime(rango[1]))
-
-mask_banco = pd.Series(True, index=df_f.index)
-if "banco" in df_f.columns:
-    banco_sel = st.sidebar.multiselect("Banco", sorted(df_f["banco"].unique()))
-    if banco_sel:
-        mask_banco = df_f["banco"].isin(banco_sel)
-
-mask_codigo = pd.Series(True, index=df_f.index)
-codigo_buscar = st.sidebar.text_input("Buscar por Código")
-if codigo_buscar:
-    mask_codigo = df_f["codigo"].astype(str).str.contains(codigo_buscar, case=False, na=False)
-
-mask_nombre = pd.Series(True, index=df_f.index)
-nombre_buscar = st.sidebar.text_input("Buscar por Nombre")
-if nombre_buscar:
-    mask_nombre = df_f["nombre"].astype(str).str.contains(nombre_buscar, case=False, na=False)
-
-mask_prestamo = pd.Series(True, index=df_f.index)
-prestamo_buscar = st.sidebar.text_input("Buscar por Préstamo")
-if prestamo_buscar:
-    mask_prestamo = df_f["prestamo"].astype(str).str.contains(prestamo_buscar, case=False, na=False)
-
-# NUEVO: Filtro por oficial
-mask_oficial = pd.Series(True, index=df_f.index)
-if "oficial" in df_f.columns:
-    oficial_sel = st.sidebar.multiselect("Oficial", sorted(df_f["oficial"].dropna().unique()))
-    if oficial_sel:
-        mask_oficial = df_f["oficial"].isin(oficial_sel)
-
-# Aplicar todos los filtros
-df_f = df_f[mask_fecha & mask_banco & mask_codigo & mask_nombre & mask_prestamo & mask_oficial]
+if f_codigo:
+    df_f = df_f[df_f.astype(str).apply(lambda x: f_codigo in " ".join(x), axis=1)]
+if f_prestamo:
+    df_f = df_f[df_f.astype(str).apply(lambda x: f_prestamo in " ".join(x), axis=1)]
+if f_nombre:
+    df_f = df_f[df_f.astype(str).apply(
+        lambda x: f_nombre.lower() in " ".join(x).lower(), axis=1
+    )]
+if f_banco:
+    df_f = df_f[df_f["banco"] == f_banco]
 
 # =============================
-# FORMATO
+# TABLA
 # =============================
-if "monto" in df_f.columns:
-    df_f["monto_$"] = df_f["monto"].apply(lambda x: f"${x:,.2f}")
-if "fecha" in df_f.columns:
-    df_f["fecha"] = df_f["fecha"].dt.strftime("%d/%m/%Y")
+df_f["monto_fmt"] = df_f["monto"].apply(money)
+st.dataframe(df_f, use_container_width=True)
 
 # =============================
-# DASHBOARD
+# GRÁFICA
 # =============================
-st.title("📊 Conciliación de Pagos")
+st.subheader("📊 Pagos por Banco")
 
-c1, c2 = st.columns(2)
-if "monto" in df_f.columns:
-    c1.metric("💰 Total Pagado", f"${df_f['monto'].sum():,.2f}")
-c2.metric("📄 Registros", len(df_f))
+chart = df_f.groupby("banco", as_index=False)["monto"].sum()
 
-cols_mostrar = [col for col in ["fecha","nombre","codigo","prestamo","banco","oficial","monto_$"] if col in df_f.columns]
-st.dataframe(df_f[cols_mostrar], use_container_width=True)
+fig = px.bar(
+    chart,
+    x="banco",
+    y="monto",
+    color="banco",
+    color_discrete_map={
+        "POPULAR": "blue",
+        "BANRESERVAS": "orange"
+    },
+    text_auto=True
+)
 
-# =============================
-# GRÁFICOS DINÁMICOS
-# =============================
-if "banco" in df_f.columns and "monto" in df_f.columns:
-    df_graf = df_f.groupby("banco")["monto"].sum().reset_index()
-    fig = px.bar(
-        df_graf,
-        x="banco",
-        y="monto",
-        text="monto",
-        color="banco",
-        color_discrete_map={"BANRESERVAS":"#FF7F50", "POPULAR":"#1F77B4"},
-        title="💰 Total Pagos por Banco (Filtros aplicados)"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # =============================
-# PANEL ADMIN WANDER
+# HISTORIAL
 # =============================
-if st.session_state.usuario == "WANDER":
-    st.markdown("---")
-    panel_admin()
+st.subheader("🕒 Historial del Sistema")
+st.text("\n".join(st.session_state.logs))
 
-# =============================
-# CERRAR SESIÓN
-# =============================
-with st.sidebar:
-    st.markdown("---")
-    if st.button("Cerrar sesión"):
-        st.session_state.clear()
-        st.rerun()
